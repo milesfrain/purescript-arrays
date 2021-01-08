@@ -2,97 +2,136 @@ module Bench.Data.Array where
 
 import Prelude
 
-import Control.Monad.ST as ST
-import Data.Array as Array
-import Data.Array.ST as STA
-import Data.Traversable (sequence_)
+import Data.Array (concat, difference, intersect, length, mapMaybe, nubEq, range, replicate, reverse, slice, take, takeEnd, union, zipWith)
+import Data.Foldable (sum)
+import Data.Int (ceil, toNumber)
 import Data.Maybe (Maybe(..))
+import Data.Monoid (power)
 import Effect (Effect)
 import Effect.Console (log)
-import Performance.Minibench (benchWith)
+import Performance.Minibench (BenchResult, benchWith', withUnits)
 
 benchArray :: Effect Unit
 benchArray = do
-  sequence_ $ Array.intersperse (log "")
-    [ benchMapMaybe
-    , benchNubEq
-    , benchUnion
-    , benchIntersect
-    , benchDifference
-    ]
+  let
+    arr1 = arrayGen 500 100 [1,0,5,5]
+    arr2 = arrayGen 0 10000 [1,2,0]
 
+    onlyEven x = if x `mod` 2 == 0 then Just x else Nothing
 
-  where
-  shortNats = Array.range 0 100
-  longNats = Array.range 0 10000
+  bench1 "mapMaybe" (mapMaybe onlyEven) arr1
+  bench1 "mapMaybe" (mapMaybe onlyEven) arr2
+  bench1 "nubEq" nubEq arr1
+  bench1 "nubEq" nubEq arr2
+  bench2 "union" union arr1 arr2
+  bench2 "union" union arr2 arr1
+  bench2 "intersect" intersect arr1 arr2
+  bench2 "intersect" intersect arr2 arr1
+  bench2 "difference" difference arr1 arr2
+  bench2 "difference" difference arr2 arr1
 
-  -- [from..to] >>= \x -> replicate x x
-  mkArrayWithDuplicates from to = ST.run do
-    arr <- STA.new
-    ST.for from (to + 1) \n ->
-      ST.for 0 n \_ ->
-        void $ STA.push n arr
-    STA.unsafeFreeze arr
+-- | Benchmarking wrapper for a function that takes a single array
+bench1 :: forall a. String -> (Array a -> Array a) -> Array a -> Effect Unit
+bench1 label func arr = do
+  log "---------------"
+  log $ label <> " (" <> show (length arr) <> ") -> "
+    <> (show $ length $ func arr)
+  log "---------------"
+  tunedBench \_ -> func arr
 
-  -- A.filter (between 45 55 <<< fst) $
-  -- scanl (\t nxt -> bimap (_ + nxt) (_ `A.snoc` nxt) t) (Tuple 0 []) (A.range 4 200)
-  -- > [(Tuple 49 [4,5,6,7,8,9,10])]
-  shortNatsDup = Array.range 100 151 <> mkArrayWithDuplicates 4 10
+-- | Benchmarking wrapper for a function that takes two arrays
+bench2 :: forall a. String -> (Array a -> Array a -> Array a) -> Array a -> Array a -> Effect Unit
+bench2 label func arr1 arr2 = do
+  log "---------------"
+  log $ label <> " (" <> show (length arr1) <> ", " <> show (length arr2) <> ") -> "
+    <> (show $ length $ func arr1 arr2)
+  log "---------------"
+  tunedBench \_ -> func arr1 arr2
 
-  -- flip index 1 $ A.filter (between 450 550 <<< fst) $
-  -- scanl (\t nxt -> bimap (_ + nxt) (_ `A.snoc` nxt) t) (Tuple 0 []) (A.range 11 300)
-  -- > Tuple 506 [11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]
-  longNatsDup = Array.range 100 594 <> mkArrayWithDuplicates 11 33
+-- Runs a maximum of 1000 trials or up to 1 second of benchmarks.
+-- Could end up with much longer than 1 second if first trial is very slow.
+-- Opportunities for improvement:
+--   Use Aff to timeout slow benchmarks (e.g. more than 5 seconds).
+--   Not throw away the tuning trials.
+--   Keep running until trial or time target is reached.
+tunedBench :: forall a. (Unit -> a) -> Effect Unit
+tunedBench func = do
+  -- Somewhat arbitrary choice of tuning trials,
+  -- but good ignore the first cold-cache run.
+  tune <- benchWith' 2 func
+  let trials = min 1000 $ ceil $ 1.0e9 / tune.min
+  res <- benchWith' trials func
+  log $ showBenchResult res
+  log $ "Trials: " <> show trials <> ", Total time: " <> withUnits (res.mean * toNumber trials)
 
-  onlyEven x = if x `mod` 2 == 0 then Just x else Nothing
-  mod3Eq x y = (x `mod` 3) == (y `mod` 3)
+-- This should be exposed by library
+showBenchResult :: BenchResult -> String
+showBenchResult res =
+       "mean   = " <> withUnits res.mean
+  <> "\nstddev = " <> withUnits res.stdDev
+  <> "\nmin    = " <> withUnits res.min
+  <> "\nmax    = " <> withUnits res.max
 
-  benchMapMaybe = do
-    log "mapMaybe"
-    log "---------------"
+-- | Integer division where the result is rounded up.
+-- | Intended for unsigned values
+divUp :: Int -> Int -> Int
+divUp n d = (n + d - 1) / d
 
-    log $ "mapMaybe (" <> show (Array.length shortNatsDup) <> ")"
-    benchWith 1000 \_ -> Array.mapMaybe onlyEven shortNatsDup
+-- | Generates an array of a desired size filled with
+-- | duplicates or skipped values based on provided pattern.
+-- |
+-- | Example:
+-- | arrayGen 5 10 [1,0,3]
+-- |
+-- | Initial values based on desired start:
+-- | [5,6,  7  ,8,9,   10   ,11,12,  13   ]
+-- | Duplicate counts created by repeating provided pattern:
+-- | [1,0,  3  ,1,0,    3   ,1 ,0,    3   ]
+-- | Initial values duplicated or dropped by pattern:
+-- | [5,  7,7,7,8,  10,10,10,11,  13,13,13]
+-- | Trimmed result to match output size:
+-- | [5,  7,7,7,8,  10,10,10,11,  13]
+-- |
+-- | Also shuffles pattern assignment, and final ordering.
+-- | For example, the above example could have three 5's
+-- | scattered throughout the output array.
+-- |
+arrayGen :: Int -> Int -> Array Int -> Array Int
+arrayGen start total pattern =
+  let
+    cycles = divUp total $ sum pattern
+    initialSize = cycles * length pattern
+    initial = range start $ start + initialSize - 1
+    fullPattern = power pattern cycles
 
-    log $ "mapMaybe (" <> show (Array.length longNatsDup) <> ")"
-    benchWith 100 \_ -> Array.mapMaybe onlyEven longNatsDup
+    shuffleInitial = shuffle initial
 
-  benchNubEq = do
-    log "nubEq"
-    log "---------------"
+  in
+    shuffle
+      $ take total
+      $ concat
+      $ zipWith replicate fullPattern shuffleInitial
 
-    log $ "nubEq (" <> show (Array.length shortNatsDup) <> ")"
-    benchWith 1000 \_ -> Array.nubEq shortNatsDup
-
-    log $ "nubEq (" <> show (Array.length longNatsDup) <> ")"
-    benchWith 100 \_ -> Array.nubEq longNatsDup
-
-  benchUnion = do
-    log "union"
-    log "---------------"
-
-    log $ "union (" <> show (Array.length shortNatsDup) <> ")"
-    benchWith 1000 \_ -> Array.union shortNatsDup shortNatsDup
-
-    log $ "union (" <> show (Array.length longNatsDup) <> ")"
-    benchWith 100 \_ -> Array.union longNatsDup longNatsDup
-
-  benchIntersect = do
-    log "intersect"
-    log "---------------"
-
-    log $ "intersectBy (" <> show (Array.length shortNatsDup) <> ")"
-    benchWith 1000 \_ -> Array.intersect shortNatsDup shortNatsDup
-
-    log $ "intersectBy (" <> show (Array.length longNatsDup) <> ")"
-    benchWith 100 \_ -> Array.intersect longNatsDup longNatsDup
-
-  benchDifference = do
-    log "difference"
-    log "---------------"
-
-    log $ "difference (" <> show (Array.length shortNatsDup) <> ")"
-    benchWith 1000 \_ -> Array.difference shortNatsDup shortNatsDup
-
-    log $ "difference (" <> show (Array.length longNatsDup) <> ")"
-    benchWith 100 \_ -> Array.difference longNatsDup longNatsDup
+-- | Performs a structured (non-random) shuffle of array elements
+-- | which should be good enough for benchmarking most code that
+-- | involves sorting.
+-- |
+-- | Simulates a riffle shuffle where half the deck is flipped.
+-- |
+-- | Example:
+-- | shuffle [1,2,3,4,5,6,7,8] == [1,8,2,7,3,6,4,5]
+-- |
+shuffle :: forall a. Array a -> Array a
+shuffle arr =
+  let
+    len = length arr
+    halfLen = len / 2
+    firstHalf = take halfLen arr
+    lastHalf = takeEnd halfLen arr
+    -- Will be the center element for odd number of elements.
+    -- Otherwise an empty array.
+    oddPiece = slice halfLen ((len - 1) / 2) arr
+  in
+    append oddPiece
+      $ concat
+      $ zipWith (\a b -> [a,b]) firstHalf $ reverse lastHalf
